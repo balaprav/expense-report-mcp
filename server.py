@@ -1,7 +1,13 @@
 import json
 import csv
 import io
+import os
+import re
 from datetime import datetime
+from pathlib import Path
+
+import pytesseract
+from PIL import Image, ImageEnhance, ImageFilter
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("expense-report")
@@ -136,6 +142,206 @@ def extract_receipt(receipt_text: str) -> str:
         },
         "receipt_text": receipt_text,
         "suggested_category": _categorize(receipt_text),
+    }, indent=2)
+
+
+def _preprocess_image(image: Image.Image) -> Image.Image:
+    """Enhance a receipt image for better OCR accuracy."""
+    # Convert to grayscale
+    image = image.convert("L")
+    # Increase contrast
+    image = ImageEnhance.Contrast(image).enhance(2.0)
+    # Sharpen
+    image = image.filter(ImageFilter.SHARPEN)
+    # Increase size if too small (OCR works better on larger images)
+    width, height = image.size
+    if width < 1000:
+        scale = 1000 / width
+        image = image.resize((int(width * scale), int(height * scale)), Image.LANCZOS)
+    return image
+
+
+def _parse_receipt_ocr(raw_text: str) -> dict:
+    """Extract structured fields from raw OCR text."""
+    lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
+
+    result = {
+        "vendor": "",
+        "date": "",
+        "items": [],
+        "subtotal": None,
+        "tax": None,
+        "tip": None,
+        "total": None,
+        "payment_method": "",
+        "raw_text": raw_text,
+    }
+
+    # Vendor is typically the first non-empty line
+    if lines:
+        result["vendor"] = lines[0]
+
+    # Date patterns: MM/DD/YYYY, MM-DD-YYYY, YYYY-MM-DD, Month DD YYYY
+    date_patterns = [
+        r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        r'(\d{4}[/-]\d{1,2}[/-]\d{1,2})',
+        r'((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2},?\s+\d{4})',
+    ]
+    for pattern in date_patterns:
+        match = re.search(pattern, raw_text, re.IGNORECASE)
+        if match:
+            result["date"] = match.group(1)
+            break
+
+    # Money amounts — look for total, subtotal, tax, tip
+    total_patterns = [
+        (r'(?:total|amount\s*due|balance)\s*[:\$]?\s*\$?(\d+\.\d{2})', 'total'),
+        (r'(?:subtotal|sub\s*total)\s*[:\$]?\s*\$?(\d+\.\d{2})', 'subtotal'),
+        (r'(?:tax|sales\s*tax|hst|gst)\s*[:\$]?\s*\$?(\d+\.\d{2})', 'tax'),
+        (r'(?:tip|gratuity)\s*[:\$]?\s*\$?(\d+\.\d{2})', 'tip'),
+    ]
+    for pattern, field in total_patterns:
+        match = re.search(pattern, raw_text, re.IGNORECASE)
+        if match:
+            result[field] = float(match.group(1))
+
+    # If we found multiple "total" matches, the largest is likely the grand total
+    all_amounts = re.findall(r'\$?(\d+\.\d{2})', raw_text)
+    if all_amounts and result["total"] is None:
+        amounts = [float(a) for a in all_amounts]
+        result["total"] = max(amounts)
+
+    # Payment method
+    payment_keywords = {
+        "visa": "Visa",
+        "mastercard": "Mastercard",
+        "amex": "Amex",
+        "american express": "Amex",
+        "discover": "Discover",
+        "debit": "Debit Card",
+        "cash": "Cash",
+        "apple pay": "Apple Pay",
+        "google pay": "Google Pay",
+    }
+    text_lower = raw_text.lower()
+    for keyword, method in payment_keywords.items():
+        if keyword in text_lower:
+            result["payment_method"] = method
+            break
+
+    # Extract line items (lines with a dollar amount)
+    for line in lines:
+        item_match = re.match(r'^(.+?)\s+\$?(\d+\.\d{2})\s*$', line)
+        if item_match:
+            item_name = item_match.group(1).strip()
+            item_amount = float(item_match.group(2))
+            # Skip if it's a total/tax/tip line
+            skip_words = ['total', 'subtotal', 'tax', 'tip', 'gratuity', 'change', 'balance']
+            if not any(w in item_name.lower() for w in skip_words):
+                result["items"].append({"name": item_name, "amount": item_amount})
+
+    return result
+
+
+@mcp.tool()
+def scan_receipt(image_path: str) -> str:
+    """Scan a receipt image and extract expense data using OCR.
+
+    Supports JPG, PNG, TIFF, BMP, and WebP formats. The image is preprocessed
+    for better accuracy (contrast enhancement, sharpening, upscaling).
+
+    Args:
+        image_path: Absolute file path to the receipt image
+                    (e.g. "/Users/you/Desktop/receipt.jpg")
+    """
+    path = Path(image_path).expanduser()
+    if not path.exists():
+        return json.dumps({"status": "error", "message": f"File not found: {image_path}"})
+
+    supported = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
+    if path.suffix.lower() not in supported:
+        return json.dumps({
+            "status": "error",
+            "message": f"Unsupported format: {path.suffix}. Use: {', '.join(supported)}"
+        })
+
+    try:
+        image = Image.open(path)
+        processed = _preprocess_image(image)
+        raw_text = pytesseract.image_to_string(processed)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": f"OCR failed: {str(e)}"})
+
+    parsed = _parse_receipt_ocr(raw_text)
+    category = _categorize(parsed["vendor"])
+
+    return json.dumps({
+        "status": "success",
+        "message": "Receipt scanned successfully. Review the extracted data and call add_expense to save it.",
+        "extracted_data": {
+            "vendor": parsed["vendor"],
+            "total": parsed["total"],
+            "date": parsed["date"],
+            "tax": parsed["tax"],
+            "tip": parsed["tip"],
+            "payment_method": parsed["payment_method"],
+            "items": parsed["items"],
+            "suggested_category": category,
+        },
+        "raw_ocr_text": parsed["raw_text"],
+    }, indent=2)
+
+
+@mcp.tool()
+def scan_receipt_folder(folder_path: str, project: str = "") -> str:
+    """Scan all receipt images in a folder and extract expense data from each.
+
+    Args:
+        folder_path: Absolute path to folder containing receipt images
+        project: Project/trip name to tag all expenses with (optional)
+    """
+    path = Path(folder_path).expanduser()
+    if not path.exists() or not path.is_dir():
+        return json.dumps({"status": "error", "message": f"Folder not found: {folder_path}"})
+
+    supported = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
+    image_files = sorted(
+        f for f in path.iterdir()
+        if f.suffix.lower() in supported
+    )
+
+    if not image_files:
+        return json.dumps({"status": "error", "message": f"No image files found in {folder_path}"})
+
+    results = []
+    for img_file in image_files:
+        try:
+            image = Image.open(img_file)
+            processed = _preprocess_image(image)
+            raw_text = pytesseract.image_to_string(processed)
+            parsed = _parse_receipt_ocr(raw_text)
+            results.append({
+                "file": img_file.name,
+                "vendor": parsed["vendor"],
+                "total": parsed["total"],
+                "date": parsed["date"],
+                "tax": parsed["tax"],
+                "tip": parsed["tip"],
+                "payment_method": parsed["payment_method"],
+                "suggested_category": _categorize(parsed["vendor"]),
+                "items": parsed["items"],
+            })
+        except Exception as e:
+            results.append({
+                "file": img_file.name,
+                "error": str(e),
+            })
+
+    return json.dumps({
+        "status": "success",
+        "message": f"Scanned {len(results)} receipts. Review the data and call add_expense for each to save them.",
+        "project": project,
+        "receipts": results,
     }, indent=2)
 
 

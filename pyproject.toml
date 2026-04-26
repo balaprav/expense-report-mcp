@@ -5,6 +5,8 @@ description = "MCP server for extracting receipt data and generating expense rep
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.0.0",
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0.0",
 ]
 
 [build-system]
