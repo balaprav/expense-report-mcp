@@ -195,10 +195,11 @@ def _parse_receipt_ocr(raw_text: str) -> dict:
 
     # Money amounts — look for total, subtotal, tax, tip
     total_patterns = [
-        (r'(?:total|amount\s*due|balance)\s*[:\$]?\s*\$?(\d+\.\d{2})', 'total'),
         (r'(?:subtotal|sub\s*total)\s*[:\$]?\s*\$?(\d+\.\d{2})', 'subtotal'),
         (r'(?:tax|sales\s*tax|hst|gst)\s*[:\$]?\s*\$?(\d+\.\d{2})', 'tax'),
         (r'(?:tip|gratuity)\s*[:\$]?\s*\$?(\d+\.\d{2})', 'tip'),
+        (r'(?<!sub)total\s*[:\$]?\s*\$?(\d+\.\d{2})', 'total'),
+        (r'(?:amount\s*due|balance\s*due)\s*[:\$]?\s*\$?(\d+\.\d{2})', 'total'),
     ]
     for pattern, field in total_patterns:
         match = re.search(pattern, raw_text, re.IGNORECASE)
